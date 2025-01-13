@@ -1,0 +1,206 @@
+name: Deploy Hugo site to Pages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      HUGO_VERSION: 0.121.1
+    steps:
+      - name: Install Hugo CLI
+        run: |
+          wget -O ${{ runner.temp }}/hugo.deb https://github.com/gohugoio/hugo/releases/download/v${HUGO_VERSION}/hugo_extended_${HUGO_VERSION}_linux-amd64.deb \
+          && sudo dpkg -i ${{ runner.temp }}/hugo.deb          
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v4
+
+      - name: Init Hugo Site
+        run: |
+          # 创建 Hugo 站点配置
+          cat > config.toml <<EOL
+          baseURL = 'https://dreamfly11712.github.io/Articles/'
+          # 后续如果要自定义域名需要改为baseURL = 'https://example.com/'
+          languageCode = 'zh-cn'
+          title = 'Articles'
+          theme = 'paper'
+          
+          [params]
+            github = 'dreamfly11712'
+            rss = true
+            color = 'linen'
+            
+          [taxonomies]
+            category = 'categories'
+            tag = 'tags'
+            
+          [markup.goldmark.renderer]
+            unsafe = true
+          EOL
+          
+          # 下载并设置主题
+          git clone https://github.com/nanxiaobei/hugo-paper themes/paper
+          
+          # 创建自定义主页模板
+          mkdir -p layouts
+          cat > layouts/index.html <<EOL
+          {{ define "main" }}
+          <article class="post-single">
+            <div class="post-content">
+              <!-- 按文件夹结构显示文章 -->
+              {{ \$pages := .Site.RegularPages }}
+              {{ \$sections := slice }}
+              {{ range \$pages }}
+                {{ \$section := path.Dir .File.Path }}
+                {{ if and (ne \$section ".") (ne \$section "posts") }}
+                  {{ if not (in \$sections \$section) }}
+                    {{ \$sections = \$sections | append \$section }}
+                  {{ end }}
+                {{ end }}
+              {{ end }}
+              
+              <!-- 首先显示根目录文章 -->
+              {{ \$rootPages := where \$pages "File.Dir" "posts/" }}
+              {{ if \$rootPages }}
+              <div class="folder">
+                <ul>
+                  {{ range sort \$rootPages "Title" }}
+                    <li>
+                      <a href="{{ .Permalink }}">{{ .Title }}</a>
+                    </li>
+                  {{ end }}
+                </ul>
+              </div>
+              {{ end }}
+              
+              <!-- 然后显示其他文件夹 -->
+              {{ range sort \$sections }}
+                {{ \$section := . }}
+                <div class="folder">
+                  <h3>📁 {{ . }}</h3>
+                  <ul>
+                    {{ range sort (\$pages.ByTitle) }}
+                      {{ if eq (path.Dir .File.Path) \$section }}
+                        <li>
+                          <a href="{{ .Permalink }}">{{ .Title }}</a>
+                        </li>
+                      {{ end }}
+                    {{ end }}
+                  </ul>
+                </div>
+              {{ end }}
+            </div>
+          </article>
+          
+          <style>
+          .folder {
+            margin-bottom: 1.5rem;
+            border-radius: var(--radius);
+            background: var(--secondary);
+          }
+          .folder h3 {
+            margin: 0;
+            padding: 1rem;
+            font-size: 1.1rem;
+            border-bottom: 1px solid var(--border);
+          }
+          .folder ul {
+            list-style: none;
+            padding: 1rem;
+            margin: 0;
+          }
+          .folder li {
+            margin: 0.5rem 0;
+          }
+          .folder li a {
+            text-decoration: none;
+            color: var(--primary);
+          }
+          .folder li a:hover {
+            text-decoration: underline;
+          }
+          </style>
+          {{ end }}
+          EOL
+          
+          # 创建内容目录结构
+          mkdir -p content
+          
+          # 移动并组织 Markdown 文件
+          find . -name "*.md" -not -path "./themes/*" -not -path "./archetypes/*" -not -path "./content/*" -not -path "./layouts/*" | while read file; do
+            # 获取相对路径
+            rel_path=${file#./}
+            dir_path=$(dirname "$rel_path")
+            
+            # 如果不是在根目录，创建对应的内容目录
+            if [ "$dir_path" != "." ]; then
+              mkdir -p "content/$dir_path"
+              target_path="content/$rel_path"
+            else
+              target_path="content/posts/$(basename "$rel_path")"
+            fi
+            
+            # 移动文件并添加/更新前置数据
+            if [ -f "$file" ]; then
+              title=$(basename "$file" .md)
+              date=$(git log -1 --format=%aI -- "$file")
+              lastmod=$(git log -1 --format=%aI -- "$file")
+              
+              # 如果文件没有 front matter，添加它
+              if ! grep -q "^---" "$file"; then
+                temp_file=$(mktemp)
+                echo "---" > "$temp_file"
+                echo "title: \"$title\"" >> "$temp_file"
+                echo "date: $date" >> "$temp_file"
+                echo "lastmod: $lastmod" >> "$temp_file"
+                echo "---" >> "$temp_file"
+                cat "$file" >> "$temp_file"
+                mkdir -p $(dirname "$target_path")
+                mv "$temp_file" "$target_path"
+              else
+                mkdir -p $(dirname "$target_path")
+                mv "$file" "$target_path"
+              fi
+            fi
+          done
+
+      - name: Build with Hugo
+        env:
+          HUGO_ENVIRONMENT: production
+          HUGO_ENV: production
+        run: hugo --gc --minify
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
